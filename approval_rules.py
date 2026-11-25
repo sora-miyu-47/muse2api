@@ -100,8 +100,13 @@ _BLACKLIST_RE = [(cid, desc, re.compile(rx, re.I | re.M)) for cid, desc, rx in B
 
 # 这些词作为命令才危险（history / env / set / kill …），出现在助手写的英文说明里是普通单词，
 # 扫说明时跳过它们；其它黑名单类别（删除、发消息、凭据名词、付款、账号、远程脚本）照常生效。
+# profile / account / settings 在说明里多是名词（「角色简介 character profile」）；改账号的说法
+# （link your account、change password、delete account、connect to …）仍由其它分支命中。
 _PROSE_SKIP = {"env", "set", "export", "history", "del", "rd", "kill", "service", "mount", "su", "shutdown",
-               "reboot", "erase", "purge", "truncate", "wipe"}
+               "reboot", "erase", "purge", "truncate", "wipe", "profile", "account", "accounts", "setting", "settings"}
+# 「登录页 / login page」只是在描述一个页面，不是用凭据登录
+_PROSE_LOGIN = re.compile(r"^(log\s?in|sign\s?in)$", re.I)
+_PROSE_PAGE_AFTER = re.compile(r"^[\s-]*(page|screen|form|entry|entrance|portal)\b", re.I)
 
 
 def blacklist_hit(text: str, prose: bool = False) -> tuple[str, str, str] | None:
@@ -110,6 +115,8 @@ def blacklist_hit(text: str, prose: bool = False) -> tuple[str, str, str] | None
         for m in rx.finditer(t):
             frag = m.group(0).strip()
             if prose and frag.lower() in _PROSE_SKIP:
+                continue
+            if prose and _PROSE_LOGIN.match(frag) and _PROSE_PAGE_AFTER.match(t[m.end():]):
                 continue
             return cid, desc, frag[:60]
     return None
@@ -254,6 +261,8 @@ WHITELIST_RULES: list[tuple[str, str]] = [
     ("git_clone", "git clone：只允许 https 的 github.com / gitlab.com，URL 不能带账号密码"),
     ("http_get", "curl / wget：只允许对白名单域名做 GET 下载，只认列出的选项（禁止 -d/-F/-T/-X/-H/-u/-b/-K、管道与重定向）"),
     ("net_access", "网络访问卡片：目标域名全部在白名单内（只读的代码托管 / 包仓库域名）"),
+    ("trusted_host", "网络访问卡片：目标是你在管理页 / .env（MUSE2API_AUTO_APPROVE_HOSTS）里填的信任主机，"
+                     "必须读到详情字段，且只放行 GET / HEAD、策略 tool.exec"),
     ("uv", "【构建安装】uv sync / lock / venv / add <包名> / pip install <包名>：禁止 URL、git+、-r/-e/-c 文件、自定义索引、自定义解释器路径"),
     ("pip", "【构建安装】pip / python -m pip install <包名>：禁止 URL、git+、-r/-e/-c 文件、自定义索引"),
     ("npm", "【构建安装】npm ci / npm install [包名] / npm test / npm run build|test|lint、pnpm/yarn install：只认列出的选项"),
@@ -641,11 +650,37 @@ def _host_ok(line: str) -> bool:
     return url_ok(url)
 
 
-def _segment_ok(seg: str, commands: list[str], rules: set[str], slot: str = "") -> bool:
+# 信任主机：主机名 / IPv4 / [IPv6]，可带端口；不允许通配符、协议、路径
+_TRUSTED_HOST_RE = re.compile(
+    r"^(?:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"|(?:\d{1,3}\.){3}\d{1,3}|\[[0-9a-f:]{2,45}\])(?::\d{1,5})?$")
+
+
+def normalize_trusted_host(value: str) -> str | None:
+    """校验并规范化一个信任主机；不合格返回 None。"""
+    h = normalize(str(value or "")).strip().lower().rstrip(".")
+    if not h or len(h) > 253 or not _TRUSTED_HOST_RE.match(h):
+        return None
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?", h) and \
+            any(int(x) > 255 for x in h.split(":", 1)[0].split(".")):
+        return None
+    if ":" in h and not h.startswith("[") and not h.rsplit(":", 1)[1].isdigit():
+        return None
+    port = h.rsplit(":", 1)[1] if re.search(r":\d+$", h) else None
+    if port is not None and not 0 < int(port) < 65536:
+        return None
+    return h
+
+
+def _segment_ok(seg: str, commands: list[str], rules: set[str], slot: str = "",
+                trusted: frozenset = frozenset()) -> bool:
     """模板里 {subject}/{action}/{summary}/{requestName} 位置的内容：短标签、白名单命令或白名单域名；
-    {host} 位置只能是白名单域名。"""
+    {host} 位置只能是白名单域名或信任主机（信任主机必须另有详情字段确认方法）。"""
     s = seg.strip().strip("`'\"")
     if slot == "host":
+        if s.lower() in trusted:
+            rules.add("trusted_host")
+            return True
         if _HOST_LINE.match(s) and _host_ok(s):
             rules.add("net_access")
             return True
@@ -670,8 +705,8 @@ _GIT_FETCH_PATH = re.compile(r"^/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+?(\.git)?/(git
 _URL_PATH = re.compile(r"^/[A-Za-z0-9._~/%+@:\-]*(\?[A-Za-z0-9._~/%+=&\-]*)?$")
 
 
-def _fields_verdict(fields: list, title_hosts: set[str]) -> str | None:
-    """校验外联详情字段，通过返回 None，否则返回待定原因。"""
+def _fields_verdict(fields: list, title_hosts: set[str], trusted: frozenset = frozenset()) -> str | None:
+    """校验外联详情字段，通过返回 None，否则返回待定原因。信任主机只放行 GET / HEAD。"""
     d = {}
     for k, v in fields:
         d[normalize(k).strip().lower()] = normalize(v).strip()
@@ -679,8 +714,8 @@ def _fields_verdict(fields: list, title_hosts: set[str]) -> str | None:
     if extra:
         return "详情里有不认识的字段: " + ",".join(sorted(extra))[:80]
     host = d.get("host", "").lower()
-    if not host or host not in SAFE_HOSTS:
-        return f"外联目标不在白名单域名内: {host[:80]}"
+    if not host or (host not in SAFE_HOSTS and host not in trusted):
+        return f"外联目标不在白名单域名或信任主机内: {host[:80]}"
     if title_hosts and title_hosts != {host}:
         return "标题与详情里的域名不一致"
     if d.get("policy", "") not in ALLOWED_POLICIES:
@@ -726,10 +761,12 @@ def _match_header(line: str):
 
 
 def classify(text: str, codes: list[str] | None = None, allow_build: bool = True,
-             fields: list | None = None, summary: str = "") -> Verdict:
+             fields: list | None = None, summary: str = "", trusted_hosts=()) -> Verdict:
     """对一张审批卡的操作描述全文做三档判定。allow_build=False 时构建安装类规则不放行。
 
-    fields: 外联卡详情里的 (键, 值)；summary: 助手写的说明（只过黑名单，不当作操作）。"""
+    fields: 外联卡详情里的 (键, 值)；summary: 助手写的说明（只过黑名单，不当作操作）；
+    trusted_hosts: 主人信任的主机（只用于网络访问卡，必须有详情字段且方法是 GET / HEAD）。"""
+    trusted = frozenset(h for h in (normalize_trusted_host(x) for x in (trusted_hosts or ())) if h)
     raw = normalize(text or "")
     fields = [(normalize(k), normalize(v)) for k, v in (fields or [])]
     summary = normalize(summary or "")
@@ -758,12 +795,16 @@ def classify(text: str, codes: list[str] | None = None, allow_build: bool = True
     # git smart-HTTP 的 /git-upload-pack 是只读拉取，扫描前去掉这个后缀以免误判为 upload。
     scan = [ln for k, ln, g in parsed if k == "line"]
     scan += [v for k, ln, g in parsed if k == "content" for v in (g or {}).values()]
-    scan += [ln for k, ln, g in parsed if k == "content" and g == {}]   # 来源说明行整行扫
+    # 来源说明行（「This task comes from the side chat "…"」）里是聊天标题，和助手说明一样按英文散文扫
+    prose = [ln for k, ln, g in parsed if k == "content" and g == {}]
+    if summary:
+        prose.append(summary)
     scan += names + codes
     # 再扫一遍 shell 去引号后的样子：~/.s"sh"/id_"rsa" 在 shell 里就是 ~/.ssh/id_rsa
     scan += [_dequoted(x) for x in list(scan)]
+    prose += [_dequoted(x) for x in list(prose)]
     scan += [re.sub(r"/(git-upload-pack|info/refs)$", "", v) for k, v in fields]
-    hit = blacklist_hit("\n".join(scan)) or (blacklist_hit(summary, prose=True) if summary else None)
+    hit = blacklist_hit("\n".join(scan)) or (blacklist_hit("\n".join(prose), prose=True) if prose else None)
     if hit:
         cid, desc, frag = hit
         return Verdict("block", cid, f"命中黑名单「{desc}」: {frag}")
@@ -775,7 +816,7 @@ def classify(text: str, codes: list[str] | None = None, allow_build: bool = True
             continue
         if kind == "content" and groups == {}:
             continue
-        if kind == "content" and all(_segment_ok(v, commands, rules, k) for k, v in groups.items()):
+        if kind == "content" and all(_segment_ok(v, commands, rules, k, trusted) for k, v in groups.items()):
             continue
         rid = command_rule(line)
         if rid:
@@ -802,15 +843,75 @@ def classify(text: str, codes: list[str] | None = None, allow_build: bool = True
         return Verdict("unknown", "egress_fields", "外联卡没有读到详情字段（Host / Method / Path / Policy），不自动处理")
     if fields:
         title_hosts = {seg.lower() for k, ln, g in parsed if k == "content" for n, seg in (g or {}).items() if n == "host"}
-        why = _fields_verdict(fields, title_hosts)
+        why = _fields_verdict(fields, title_hosts, trusted)
         if why:
             return Verdict("unknown", "egress_fields", why)
-        rules.add("net_access")
-    if not commands and "net_access" not in rules:
+        host = next((normalize(v).strip().lower() for k, v in fields if normalize(k).strip().lower() == "host"), "")
+        rules.add("net_access" if host in SAFE_HOSTS else "trusted_host")
+    elif "trusted_host" in rules:
+        return Verdict("unknown", "egress_fields", "信任主机的访问卡没有读到详情字段（Method / Path / Policy），不自动处理")
+    if not commands and not rules & {"net_access", "trusted_host"}:
         return Verdict("unknown", "no_operation", "卡片里没有可识别的具体操作")
     if not allow_build and rules & BUILD_RULES:
         return Verdict("unknown", "build_disabled", "构建安装类命令的自动放行已关闭: " + ",".join(sorted(rules & BUILD_RULES)))
     return Verdict("allow", ",".join(sorted(rules)), "全部内容命中白名单", commands)
+
+
+# ---------------------------------------------------------------------------
+# 全放行模式：除了底线（付款、发送凭据）其它卡片一律放行。底线规则比黑名单窄：
+# 登录页 / session / auth 这类说法不算；目标是信任主机时，凭据底线也不拦（发给你自己的服务器）。
+# ---------------------------------------------------------------------------
+FLOOR = [
+    ("payment", "付款 / 下单 / 绑卡", BLACKLIST[[c for c, _, _ in BLACKLIST].index("payment")][2]
+     + r"|\bplace\s+(an?\s+|the\s+)?orders?\b"),
+    ("credential", "发送密码 / cookie / 密钥",
+     r"cookie|\btokens?\b|token=|passw|\bpwd=|secret|credential|api[_ -]?key|apikey|private[_ -]?key|access[_ -]?key"
+     r"|\.ssh\b|id_rsa|id_ed25519|id_ecdsa|\.netrc|\.git-credentials|\.aws\b|\.kube\b|\.docker/config|\.npmrc"
+     r"|\.pypirc|\.gnupg|keychain|keyring|1password|bitwarden|lastpass|/proc/\S*environ|\.env\b|/etc/shadow"
+     r"|authori[sz]ation|\bbearer\b|hatch_|凭据|憑證|密码|密碼|密钥|密鑰|令牌|口令|パスワード"),
+]
+_FLOOR_RE = [(cid, desc, re.compile(rx, re.I | re.M)) for cid, desc, rx in FLOOR]
+# 说明文字里的普通用法：in order to / sort order / check out the page / spend time / ledger transactions
+_FLOOR_PROSE_SKIP = {"order", "orders", "ordering", "check out", "checkout", "spend", "transaction", "book"}
+
+
+def floor_hit(text: str, prose: bool = False, skip: tuple = ()) -> tuple[str, str, str] | None:
+    t = normalize(text)
+    for cid, desc, rx in _FLOOR_RE:
+        if cid in skip:
+            continue
+        for m in rx.finditer(t):
+            frag = m.group(0).strip()
+            if prose and re.sub(r"\s+", " ", frag.lower()) in _FLOOR_PROSE_SKIP:
+                continue
+            return cid, desc, frag[:60]
+    return None
+
+
+def classify_allow_all(text: str, codes: list[str] | None = None, fields: list | None = None, summary: str = "",
+                       trusted_hosts=()) -> Verdict:
+    """全放行模式：只查底线（付款、发送凭据），其它全部放行。"""
+    raw = normalize(text or "")
+    codes = [normalize(c) for c in (codes or []) if c and c.strip()]
+    fields = [(normalize(k), normalize(v)) for k, v in (fields or [])]
+    summary = normalize(summary or "")
+    if not (raw.strip() or summary.strip() or fields):
+        return Verdict("unknown", "empty", "没有读到卡片描述文本")
+    if len(raw) + len(summary) + sum(len(c) for c in codes) > MAX_CARD_TEXT * 2:
+        return Verdict("unknown", "too_long", "卡片文本过长，不自动判定")
+    trusted = frozenset(h for h in (normalize_trusted_host(x) for x in (trusted_hosts or ())) if h)
+    host = next((v.strip().lower() for k, v in fields if k.strip().lower() == "host"), "")
+    skip = ("credential",) if host and host in trusted else ()
+    lines = [seg.strip() for ln in raw.split("\n") for seg in re.split(r"(?<=[?？。])\s*", ln) if seg.strip()]
+    prose = [ln for ln in lines if _SOURCE_LINE.match(ln)] + ([summary] if summary else [])
+    strict = [ln for ln in lines if not _SOURCE_LINE.match(ln)] + codes + [f"{k}: {v}" for k, v in fields]
+    strict += [_dequoted(x) for x in list(strict)]
+    prose += [_dequoted(x) for x in list(prose)]
+    hit = floor_hit("\n".join(strict), skip=skip) or floor_hit("\n".join(prose), prose=True, skip=skip)
+    if hit:
+        cid, desc, frag = hit
+        return Verdict("block", cid, f"全放行模式的底线「{desc}」: {frag}")
+    return Verdict("allow", "allow_all", "全放行模式：没有碰到付款 / 发送凭据底线")
 
 
 # ---------------------------------------------------------------------------

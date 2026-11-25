@@ -1,0 +1,13 @@
+{
+  "version": "1.6.12",
+  "updated_at": "2026-11-19",
+  "repo": "https://github.com/czg86389-hub/muse2api",
+  "highlights": [
+    "修复 #62：muse.ai 从 2026-11-19 起聊天里只显示约 498px 的缩略图，生成的图片因此变小。现在图片任务会打开 muse.ai 的图片查看器取原图（实测 1344x1792），取不到时仍返回缩略图并在日志里提示。",
+    "只影响图片任务；视频、对话与参考素材上传不变。无需升级浏览器插件。"
+  ],
+  "highlights_en": [
+    "Fix #62: since 2026-11-19 muse.ai shows only a ~498px thumbnail in the chat, so generated images came back small. Image tasks now open muse.ai's image viewer and return the full-size picture (measured 1344x1792); if it cannot be opened the thumbnail is still returned and a warning is logged.",
+    "Images only; video, chat and reference uploads are unchanged. No extension upgrade is needed."
+  ]
+}

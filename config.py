@@ -138,6 +138,20 @@ class Config:
     chat_user_queue_timeout: int = field(
         default_factory=lambda: max(0, int(_env("MUSE2API_CHAT_USER_QUEUE_TIMEOUT", "120"))))
 
+    # 审批卡自动处理（详见 README「审批卡自动批准」）。默认关闭。
+    # 1 = 允许开启（管理页还能再关）；0/不设 = 完全不看守。
+    auto_approve: bool = field(
+        default_factory=lambda: _env("MUSE2API_AUTO_APPROVE", "0").strip() == "1")
+    # 1 = 强制演练（只记日志不点）；0 或不设 = 由管理页决定（管理页默认演练）。
+    auto_approve_dry_run: str = field(
+        default_factory=lambda: _env("MUSE2API_AUTO_APPROVE_DRY_RUN", "").strip())
+    # 0 = 强制关闭构建安装类白名单（uv/pip/npm/make/pytest 等会执行项目或依赖自带脚本）；默认允许，管理页可再关。
+    auto_approve_build: str = field(
+        default_factory=lambda: _env("MUSE2API_AUTO_APPROVE_BUILD", "").strip())
+    # 允许看守的账号（id 或备注名，逗号分隔）；留空 = 全部账号。
+    auto_approve_accounts: str = field(
+        default_factory=lambda: _env("MUSE2API_AUTO_APPROVE_ACCOUNTS", "").strip())
+
     @property
     def data_dir(self) -> str:
         return os.path.join(self.base_dir, "data")

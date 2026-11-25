@@ -33,6 +33,7 @@ import time
 import uuid
 import unicodedata
 
+from approval import APPROVAL_LIKE_JS
 from cdp import CDP, http_json
 from chat_sessions import valid_thread_path
 from proxy import HTTPProxyRelay, request_proxy_context
@@ -751,7 +752,7 @@ class MuseEngine:
         try:
             needs_nav = self.page.js("""(function(forChat){
                 var d = document.querySelector('[role="dialog"]');
-                if (d) {
+                if (d && !(%s)(d)) {
                     var b = d.querySelector('button[aria-label*="close" i], button');
                     if (b) b.click();
                 }
@@ -768,7 +769,7 @@ class MuseEngine:
                     return bubbleCount >= 24;
                 }
                 return (window.location.pathname !== '/thread/new') || bubbleCount > 0;
-            })(%s)""" % ("true" if for_chat else "false"))
+            })(%s)""" % (APPROVAL_LIKE_JS, "true" if for_chat else "false"))
             if needs_nav:
                 self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
                 t_end = time.time() + 10.0
@@ -787,6 +788,19 @@ class MuseEngine:
 
     # Set by the app: persist cookies that muse.ai rotated during an engine-side renewal.
     cookie_sink = None
+    # Set by the app: approval.ApprovalGuard，等待生成期间处理审批卡；None = 不看守。
+    approval_guard = None
+
+    def _approval_tick(self, force: bool = False) -> bool:
+        """扫描并按规则处理当前页面上的审批卡；返回页面上是否还有审批卡在等。force=True 不走节流。"""
+        guard = self.approval_guard
+        if guard is None or self.page is None:
+            return False
+        try:
+            return bool(guard.tick(self, force=force))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("审批卡看守异常: %s", exc)
+            return False
 
     def _report_rotated_cookies(self, account_id, cookies: dict, expires: dict | None):
         sink = self.cookie_sink
@@ -1266,6 +1280,8 @@ class MuseEngine:
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
             time.sleep(0.6)
             self._scroll_bottom()
+            # 有审批卡在等时，模型文本停住是正常的，不能据此判「拒绝 / 只回文字」
+            approval_pending = self._approval_tick()
             atts = self.attachments()
             # 严格按期望类型挑选附件，绝不接受跨模态兜底（如将视频请求降级为图片封面）
             matching_atts = []
@@ -1375,7 +1391,7 @@ class MuseEngine:
             refusal_source = cur_txt if cur_cnt > base_agent_cnt else (
                 tail if seen_stop and not has_stop and elapsed > 20.0 else "")
             refusal = self._media_refusal_text(refusal_source, expect)
-            if refusal and not has_stop and len(atts) <= base_att_cnt:
+            if refusal and not has_stop and not approval_pending and len(atts) <= base_att_cnt:
                 if refusal == refusal_last:
                     refusal_stable += 1
                 else:
@@ -1385,7 +1401,8 @@ class MuseEngine:
             else:
                 refusal_last, refusal_stable = "", 0
 
-            if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
+            if (cur_cnt > base_agent_cnt and cur_txt and not has_stop and not approval_pending
+                    and len(atts) <= base_att_cnt):
                 # Media-status text can precede a real attachment; do not fail on it.
                 is_media_report = self._media_status_pending(cur_txt)
                 if not is_media_report:
@@ -1586,8 +1603,8 @@ class MuseEngine:
         try:
             self.page.js("""(function(){
                 var d = document.querySelector('[role="dialog"]');
-                if (d) { var b = d.querySelector('button[aria-label*="close" i], button'); if (b) b.click(); }
-            })()""")
+                if (d && !(%s)(d)) { var b = d.querySelector('button[aria-label*="close" i], button'); if (b) b.click(); }
+            })()""" % APPROVAL_LIKE_JS)
         except Exception:  # noqa: BLE001
             pass
         if self.current_thread_path() != path:
@@ -1598,6 +1615,7 @@ class MuseEngine:
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
+            self._approval_tick()  # 上一轮遗留的审批卡也按规则处理
             cnt, txt, has_stop = self._poll_chat()
             users = self._user_count()
             now = time.time()
@@ -1679,6 +1697,9 @@ class MuseEngine:
                 # muse.ai assigns /thread/<id> on submit, before any reply text.
                 report_thread()
                 next_report = time.time() + 0.5
+            if self._approval_tick():
+                # 审批卡在等：不按「首字超时」断线，继续等到总超时
+                first_token_deadline = deadline
             cnt, cur, has_stop = self._poll_chat()
             if not cur or (cnt <= base_agent and cur == base_text):
                 if time.time() - t_sent > 14.0:
@@ -1708,6 +1729,7 @@ class MuseEngine:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
+            approval_pending = self._approval_tick()
             cnt, cur, has_stop = self._poll_chat()
             if not cur:
                 continue
@@ -1722,7 +1744,12 @@ class MuseEngine:
                 stable += 1
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
-                if (not has_stop and stable >= 3) or (has_stop and stable >= 80):
+                if approval_pending:
+                    stable = 0  # 审批卡还在等，回复没结束
+                elif (not has_stop and stable >= 3) or (has_stop and stable >= 80):
+                    if self._approval_tick(force=True):
+                        stable = 0  # 结束前再实时看一眼：刚弹出的审批卡可能还没被节流的扫描看到
+                        continue
                     report_thread()
                     return
 

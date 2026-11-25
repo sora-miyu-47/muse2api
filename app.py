@@ -2217,6 +2217,8 @@ class AutoApprovePatch(BaseModel):
     dry_run: bool | None = None
     build: bool | None = None
     accounts: dict[str, bool] | None = None
+    trusted_hosts: list[str] | None = None
+    allow_all: bool | None = None
 
 
 @app.get("/admin/auto-approve")
@@ -2230,7 +2232,11 @@ def put_auto_approve(req: AutoApprovePatch, _=Depends(auth)):
     unknown = [aid for aid in (req.accounts or {}) if aid not in known]
     if unknown:
         raise HTTPException(400, f"账号不存在: {', '.join(unknown)[:200]}")
-    APPROVAL_SETTINGS.update(enabled=req.enabled, dry_run=req.dry_run, accounts=req.accounts, build=req.build)
+    try:
+        APPROVAL_SETTINGS.update(enabled=req.enabled, dry_run=req.dry_run, accounts=req.accounts, build=req.build,
+                                 trusted_hosts=req.trusted_hosts, allow_all=req.allow_all)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return APPROVAL_SETTINGS.view(store.list_accounts())
 
 

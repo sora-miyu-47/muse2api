@@ -580,7 +580,14 @@
         <label class="aa-switch"><input type="checkbox" id="aaEnabled" onchange="saveAutoApprove({enabled:this.checked}, this)"><span>总开关</span></label>
         <label class="aa-switch"><input type="checkbox" id="aaDryRun" onchange="saveAutoApprove({dry_run:this.checked}, this)"><span>演练模式（只记日志不点）</span></label>
         <label class="aa-switch"><input type="checkbox" id="aaBuild" onchange="saveAutoApprove({build:this.checked}, this)"><span>放行构建安装类命令</span></label>
+        <label class="aa-switch"><input type="checkbox" id="aaAll" onchange="saveAutoApprove({allow_all:this.checked}, this)"><span>全放行模式（只拦付款和发送凭据）</span></label>
       </div>
+      <div class="hint" id="aaAllHint" style="display:none;color:var(--bad)">全放行模式已打开：不看白名单和黑名单，任何网址、IP、命令、删除、发消息都会自动放行。只有付款 / 下单 / 绑卡、发送密码 / cookie / 密钥这两类不点（发给信任主机的凭据也放行）。</div>
+      <form id="aaHostsForm" onsubmit="event.preventDefault();saveTrustedHosts()" style="margin-bottom:12px">
+        <div class="row"><div style="max-width:520px"><label for="aaHosts">信任主机（你自己的服务器，逗号分隔）</label><input type="text" id="aaHosts" placeholder="例如 1.2.3.4, my.example.com:8443" autocomplete="off"></div></div>
+        <div class="hint" id="aaHostsHint">小号访问这些主机的网络卡片会被放行，但只放行 GET / HEAD 读取；只填主机名或 IP，可带端口，不要协议和路径。</div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:8px"><button id="aaHostsSave" type="submit">保存信任主机</button><span class="hint" id="aaHostsEnv"></span></div>
+      </form>
       <div class="tblwrap"><table>
         <thead><tr><th>账号</th><th>看守此账号</th><th>当前状态</th></tr></thead>
         <tbody id="aaAccBody"><tr><td colspan="3" class="empty">加载中…</td></tr></tbody>
@@ -606,7 +613,8 @@
       <div class="hint">规则写在 approval_rules.py。黑名单优先于白名单；卡片里任何一行认不出来都按待定处理。</div>
       <div class="row">
         <div><b>白名单（放行）</b><ul class="aa-rules" id="aaWhitelist"></ul></div>
-        <div><b>黑名单（永不自动批准）</b><ul class="aa-rules" id="aaBlacklist"></ul></div>
+        <div><b>黑名单（永不自动批准）</b><ul class="aa-rules" id="aaBlacklist"></ul>
+          <b>全放行模式的底线（仍不批准）</b><ul class="aa-rules" id="aaFloor"></ul></div>
       </div>
     </div>
   </section>
@@ -904,6 +912,17 @@ const I18N_EN = {
   "判定规则": "Rules",
   "规则写在 approval_rules.py。黑名单优先于白名单；卡片里任何一行认不出来都按待定处理。": "Rules live in approval_rules.py. The block list wins over the allow list; any unrecognized line makes the card undecided.",
   "白名单（放行）": "Allow list (approved)",
+  "信任主机（你自己的服务器，逗号分隔）": "Trusted hosts (your own servers, comma separated)",
+  "小号访问这些主机的网络卡片会被放行，但只放行 GET / HEAD 读取；只填主机名或 IP，可带端口，不要协议和路径。": "Network cards for these hosts are approved, but only for GET / HEAD reads. Enter a host name or IP, with an optional port. Do not enter a scheme or a path.",
+  "保存信任主机": "Save trusted hosts",
+  "全放行模式（只拦付款和发送凭据）": "Approve-all mode (blocks only payments and sending credentials)",
+  "全放行模式已打开：不看白名单和黑名单，任何网址、IP、命令、删除、发消息都会自动放行。只有付款 / 下单 / 绑卡、发送密码 / cookie / 密钥这两类不点（发给信任主机的凭据也放行）。": "Approve-all mode is on: the allow and block lists are ignored, and any site, IP, command, deletion or message is approved automatically. Only payments / orders / card binding and sending passwords / cookies / keys are not approved (credentials sent to a trusted host are approved).",
+  ".env 设置了 MUSE2API_AUTO_APPROVE_ALL=0：全放行模式被强制关闭。": "MUSE2API_AUTO_APPROVE_ALL=0 is set in .env: approve-all mode is forced off.",
+  "全放行模式的底线（仍不批准）": "Approve-all floor (still not approved)",
+  "付款 / 下单 / 绑卡": "Payments / orders / card binding",
+  "发送密码 / cookie / 密钥": "Sending passwords / cookies / keys",
+  "例如 1.2.3.4, my.example.com:8443": "e.g. 1.2.3.4, my.example.com:8443",
+  "信任主机已保存": "Trusted hosts saved",
   "黑名单（永不自动批准）": "Block list (never approved automatically)",
   "账号池为空": "The account pool is empty",
   "暂无审批卡记录": "No approval card records yet",
@@ -1362,6 +1381,8 @@ const I18N_EN_HTML = {
 };
 /* 含变量的文案：[正则源码, 替换串]，按顺序匹配整段文本 */
 const I18N_EN_PATTERNS = ([
+  ["\\.env 另外信任：(.*)", ".env also trusts: $1"],
+  ["主机格式不对（只填主机名或 IP，可带端口，不要协议、路径或通配符）: (.*)", "Invalid host (enter only a host name or IP with an optional port, without a scheme, path or wildcard): $1"],
   ["账号代理请求失败 \\((.*?)\\)；请检查代理连接或认证，未回退直连", "Account proxy request failed ($1); check the proxy connection or credentials. Direct fallback was not used"],
   ["经账号代理唤醒或确认 VM 失败 \\((.*?)\\)；未回退直连", "VM wake or verification through the account proxy failed ($1); direct fallback was not used"],
   ["代理异常: (.*)", "Proxy error: $1"],
@@ -2545,10 +2566,16 @@ function renderApprovalSettings(d){
   $('aaEnabled').checked = !!admin.enabled; $('aaEnabled').disabled = !env.enabled;
   $('aaDryRun').checked = !!(admin.dry_run || env.dry_run_forced); $('aaDryRun').disabled = !env.enabled || !!env.dry_run_forced;
   $('aaBuild').checked = admin.build !== false && env.build !== false; $('aaBuild').disabled = !env.enabled || env.build === false;
+  $('aaAll').checked = !!admin.allow_all && env.allow_all !== false; $('aaAll').disabled = !env.enabled || env.allow_all === false;
+  $('aaAllHint').style.display = $('aaAll').checked && env.enabled && admin.enabled ? '' : 'none';
+  if (document.activeElement !== $('aaHosts')) $('aaHosts').value = (admin.trusted_hosts || []).join(', ');
+  $('aaHosts').disabled = $('aaHostsSave').disabled = !env.enabled;
+  $('aaHostsEnv').textContent = (env.hosts || []).length ? '.env 另外信任：' + env.hosts.join(', ') : '';
   const hints = [];
   if (!env.enabled) hints.push('.env 未设置 MUSE2API_AUTO_APPROVE=1：看守完全关闭，管理页开关不生效。');
   if (env.dry_run_forced) hints.push('.env 设置了 MUSE2API_AUTO_APPROVE_DRY_RUN=1：强制演练，不会真点。');
   if (env.build === false) hints.push('.env 设置了 MUSE2API_AUTO_APPROVE_BUILD=0：构建安装类命令不会自动放行。');
+  if (env.allow_all === false) hints.push('.env 设置了 MUSE2API_AUTO_APPROVE_ALL=0：全放行模式被强制关闭。');
   if ((env.accounts || []).length) hints.push('.env 只允许这些账号：' + env.accounts.join(', '));
   $('aaEnvHint').innerHTML = hints.map(h => `<div>${esc(h)}</div>`).join('');
   $('aaEnvHint').style.display = hints.length ? '' : 'none';
@@ -2568,6 +2595,14 @@ function renderApprovalSettings(d){
   const rules = d.rules || {};
   $('aaWhitelist').innerHTML = (rules.whitelist || []).map(r => `<li><b>${esc(r.id)}</b>：${esc(r.desc)}</li>`).join('');
   $('aaBlacklist').innerHTML = (rules.blacklist || []).map(r => `<li><b>${esc(r.id)}</b>：${esc(r.desc)}</li>`).join('');
+  $('aaFloor').innerHTML = (rules.floor || []).map(r => `<li><b>${esc(r.id)}</b>：${esc(r.desc)}</li>`).join('');
+}
+async function saveTrustedHosts(){
+  const hosts = $('aaHosts').value.split(/[\s,，]+/).map(x => x.trim()).filter(Boolean);
+  $('aaHostsSave').disabled = true;
+  try { renderApprovalSettings(await api('/admin/auto-approve', {method:'PUT', body: JSON.stringify({trusted_hosts: hosts})})); toast('信任主机已保存', 'ok'); }
+  catch(e){ toast(e.message, 'bad'); }
+  finally { $('aaHostsSave').disabled = !aaEnv.enabled; }
 }
 async function loadApproval(){
   try { renderApprovalSettings(await api('/admin/auto-approve')); }
@@ -2580,7 +2615,7 @@ async function saveAutoApprove(patch, input){
   catch(e){ toast(e.message, 'bad'); loadApproval(); }
   finally {
     if (input) input.disabled = !aaEnv.enabled || (input.id === 'aaDryRun' && !!aaEnv.dry_run_forced)
-      || (input.id === 'aaBuild' && aaEnv.build === false);
+      || (input.id === 'aaBuild' && aaEnv.build === false) || (input.id === 'aaAll' && aaEnv.allow_all === false);
   }
 }
 function aaQuery(extra){

@@ -17,6 +17,8 @@ OpenAI 兼容:
   POST   /admin/accounts/{id}/relogin
   GET    /admin/tasks               （任务记录）
   DELETE /admin/tasks/{id}  |  POST /admin/tasks/clear
+  GET|PUT /admin/auto-approve       （审批卡自动处理开关）
+  GET    /admin/auto-approve/audit  （审批卡审计日志，?account=&tier=；/export?format=csv|jsonl 导出）
   GET    /admin/media  |  POST /admin/media/delete  |  DELETE /admin/media/{name}
   GET    /admin/extension           （浏览器扩展 zip，用来取 cookie）
   GET    /admin/cookie-helper       （命令行取 cookie 脚本，进阶）
@@ -57,6 +59,7 @@ from engine import MuseProxyError, MuseSessionUnavailable, MuseThreadUnavailable
 from chat_sessions import ChatUserError, ChatUserRegistry, normalize_user, persona_digest
 from store import Store, account_expiry, min_expiry
 from generation_timing import QueuePolicy, QueueSettings, TaskTiming
+from approval import ApprovalAudit, ApprovalGuard, ApprovalSettings, TIERS as APPROVAL_TIERS
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 from thumbnails import (VIDEO_FORMATS, ThumbnailUnavailable, clear_thumbnail,
                         source_version, video_thumbnail)
@@ -212,6 +215,15 @@ CHAT_USERS = ChatUserRegistry(CFG.chat_users_file)
 IMAGE_TASK_LOCK = threading.Lock()
 QUEUE_POLICY = QueuePolicy(os.path.join(CFG.data_dir, "generation-queue.json"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _account_label(aid: str) -> str:
+    return (store.get_account(aid) or {}).get("label") or ""
+
+
+APPROVAL_SETTINGS = ApprovalSettings(os.path.join(CFG.data_dir, "auto-approve.json"), CFG, _account_label)
+APPROVAL_AUDIT = ApprovalAudit(os.path.join(CFG.data_dir, "auto-approve-audit.jsonl"))
+engine.approval_guard = ApprovalGuard(APPROVAL_SETTINGS, APPROVAL_AUDIT, _account_label)
 
 
 def _bind_account_proxy(account: dict):
@@ -2198,6 +2210,54 @@ def get_generation_queue(_=Depends(auth)):
 def save_generation_queue(req: QueueSettings, _=Depends(auth)):
     QUEUE_POLICY.save(req)
     return QUEUE_POLICY.settings()
+
+# ------------------------- 管理：审批卡自动处理 -------------------------
+class AutoApprovePatch(BaseModel):
+    enabled: bool | None = None
+    dry_run: bool | None = None
+    build: bool | None = None
+    accounts: dict[str, bool] | None = None
+
+
+@app.get("/admin/auto-approve")
+def get_auto_approve(_=Depends(auth)):
+    return APPROVAL_SETTINGS.view(store.list_accounts())
+
+
+@app.put("/admin/auto-approve")
+def put_auto_approve(req: AutoApprovePatch, _=Depends(auth)):
+    known = {a.get("id") for a in store.list_accounts()}
+    unknown = [aid for aid in (req.accounts or {}) if aid not in known]
+    if unknown:
+        raise HTTPException(400, f"账号不存在: {', '.join(unknown)[:200]}")
+    APPROVAL_SETTINGS.update(enabled=req.enabled, dry_run=req.dry_run, accounts=req.accounts, build=req.build)
+    return APPROVAL_SETTINGS.view(store.list_accounts())
+
+
+def _audit_filter(account: str | None, tier: str | None) -> tuple[str | None, str | None]:
+    if tier and tier not in APPROVAL_TIERS:
+        raise HTTPException(400, f"tier 只能是 {'/'.join(APPROVAL_TIERS)}")
+    return (account or None), (tier or None)
+
+
+@app.get("/admin/auto-approve/audit")
+def get_auto_approve_audit(account: str | None = None, tier: str | None = None, limit: int = 200,
+                           _=Depends(auth)):
+    account, tier = _audit_filter(account, tier)
+    rows = APPROVAL_AUDIT.query(account, tier, limit=max(1, min(int(limit), 2000)))
+    return {"entries": rows, "count": len(rows)}
+
+
+@app.get("/admin/auto-approve/audit/export")
+def export_auto_approve_audit(account: str | None = None, tier: str | None = None, format: str = "csv",
+                              _=Depends(auth)):
+    account, tier = _audit_filter(account, tier)
+    if format not in ("csv", "jsonl"):
+        raise HTTPException(400, "format 只能是 csv 或 jsonl")
+    body, media_type, filename = APPROVAL_AUDIT.export(account, tier, format)
+    return Response(content=body, media_type=media_type,
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
 
 @app.get("/v1/media/{name}/thumbnail")
 def get_media_thumbnail(name: str):

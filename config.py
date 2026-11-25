@@ -151,6 +151,12 @@ class Config:
     # 允许看守的账号（id 或备注名，逗号分隔）；留空 = 全部账号。
     auto_approve_accounts: str = field(
         default_factory=lambda: _env("MUSE2API_AUTO_APPROVE_ACCOUNTS", "").strip())
+    # 信任主机（主机名或 IP，可带端口，逗号分隔）：只用于网络访问卡，只放行 GET / HEAD；管理页还能再加。
+    auto_approve_hosts: str = field(
+        default_factory=lambda: _env("MUSE2API_AUTO_APPROVE_HOSTS", "").strip())
+    # 0 = 强制关闭全放行模式（除付款 / 发送凭据外全部放行）；留空由管理页决定（默认关）。
+    auto_approve_all: str = field(
+        default_factory=lambda: _env("MUSE2API_AUTO_APPROVE_ALL", "").strip())
 
     @property
     def data_dir(self) -> str:

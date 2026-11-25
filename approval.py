@@ -46,7 +46,8 @@ import threading
 import time
 import uuid
 
-from approval_rules import BLACKLIST, BUILD_RULES, WHITELIST_RULES, Verdict, classify, normalize, redact
+from approval_rules import (BLACKLIST, BUILD_RULES, FLOOR, WHITELIST_RULES, Verdict, classify, classify_allow_all,
+                            normalize, normalize_trusted_host, redact)
 
 log = logging.getLogger("muse2api")
 
@@ -282,6 +283,21 @@ def _flag(value) -> bool | None:
 # ---------------------------------------------------------------------------
 # 开关
 # ---------------------------------------------------------------------------
+def clean_hosts(values) -> tuple[list[str], list[str]]:
+    """规范化信任主机列表，返回 (合格的去重列表, 不合格的原值)。"""
+    good, bad = [], []
+    for raw in values or []:
+        if not str(raw or "").strip():
+            continue
+        h = normalize_trusted_host(raw)
+        if h:
+            if h not in good:
+                good.append(h)
+        else:
+            bad.append(str(raw).strip()[:80])
+    return good[:50], bad
+
+
 class ApprovalSettings:
     """开关 = .env（硬闸门）× 管理页（data/auto-approve.json）。
 
@@ -289,6 +305,8 @@ class ApprovalSettings:
     * 演练模式：MUSE2API_AUTO_APPROVE_DRY_RUN=1 强制演练；=0 或不设时由管理页决定（管理页默认演练）。
     * 按账号：MUSE2API_AUTO_APPROVE_ACCOUNTS 留空 = 全部账号，填 id/备注名（逗号分隔）= 只允许这些；
       管理页可以再逐个关掉（默认开）。
+    * 信任主机：MUSE2API_AUTO_APPROVE_HOSTS 与管理页填的主机合在一起；只用于网络访问卡，只放行 GET / HEAD。
+    * 全放行模式：管理页打开后，除付款和发送凭据外全部放行；MUSE2API_AUTO_APPROVE_ALL=0 强制关闭。
     任何一侧说「关 / 演练」都按更安全的那一侧执行。
     """
 
@@ -297,12 +315,15 @@ class ApprovalSettings:
         self.cfg = cfg
         self.label_resolver = label_resolver
         self.lock = threading.RLock()
-        self.value = {"enabled": True, "dry_run": True, "build": True, "accounts": {}}
+        self.value = {"enabled": True, "dry_run": True, "build": True, "accounts": {}, "trusted_hosts": [],
+                      "allow_all": False}
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            self.value.update({k: data[k] for k in ("enabled", "dry_run", "build", "accounts") if k in data})
-        except (OSError, ValueError):
+            self.value.update({k: data[k] for k in ("enabled", "dry_run", "build", "accounts", "allow_all")
+                               if k in data})
+            self.value["trusted_hosts"] = clean_hosts(data.get("trusted_hosts") or [])[0]
+        except (OSError, ValueError, TypeError):
             pass
 
     # env
@@ -315,6 +336,18 @@ class ApprovalSettings:
     def env_build(self) -> bool:
         """MUSE2API_AUTO_APPROVE_BUILD=0 强制关闭构建安装类白名单；默认允许（管理页可再关）。"""
         return _flag(getattr(self.cfg, "auto_approve_build", "")) is not False
+
+    def env_allow_all(self) -> bool:
+        """MUSE2API_AUTO_APPROVE_ALL=0 强制关闭全放行模式；留空由管理页决定（默认关）。"""
+        return _flag(getattr(self.cfg, "auto_approve_all", "")) is not False
+
+    def env_hosts(self) -> list[str]:
+        raw = getattr(self.cfg, "auto_approve_hosts", "") or ""
+        return clean_hosts(raw.replace("\n", ",").split(","))[0]
+
+    def trusted_hosts(self) -> list[str]:
+        with self.lock:
+            return sorted(set(self.env_hosts()) | set(self.value.get("trusted_hosts") or []))
 
     def env_accounts(self) -> list[str]:
         raw = getattr(self.cfg, "auto_approve_accounts", "") or ""
@@ -336,8 +369,17 @@ class ApprovalSettings:
         with self.lock:
             return json.loads(json.dumps(self.value))
 
-    def update(self, enabled=None, dry_run=None, accounts: dict | None = None, build=None) -> dict:
+    def update(self, enabled=None, dry_run=None, accounts: dict | None = None, build=None,
+               trusted_hosts: list | None = None, allow_all=None) -> dict:
         with self.lock:
+            if allow_all is not None:
+                self.value["allow_all"] = bool(allow_all)
+            if trusted_hosts is not None:
+                hosts, bad = clean_hosts(trusted_hosts)
+                if bad:
+                    raise ValueError("主机格式不对（只填主机名或 IP，可带端口，不要协议、路径或通配符）: "
+                                     + ", ".join(bad)[:200])
+                self.value["trusted_hosts"] = hosts
             if build is not None:
                 self.value["build"] = bool(build)
             if enabled is not None:
@@ -375,17 +417,20 @@ class ApprovalSettings:
             dry = self.env_dry_run() or bool(v.get("dry_run", True))
             return {"enabled": True, "mode": "dry-run" if dry else "live",
                     "allow_build": self.env_build() and bool(v.get("build", True)),
+                    "trusted_hosts": self.trusted_hosts(),
+                    "allow_all": self.env_allow_all() and bool(v.get("allow_all", False)),
                     "reason": ".env 强制演练" if self.env_dry_run() else ("管理页演练模式" if dry else "")}
 
     def view(self, accounts: list[dict] | None = None) -> dict:
         return {
             "env": {"enabled": self.env_enabled(), "dry_run_forced": self.env_dry_run(), "build": self.env_build(),
-                    "accounts": self.env_accounts()},
+                    "accounts": self.env_accounts(), "hosts": self.env_hosts(), "allow_all": self.env_allow_all()},
             "admin": self.admin(),
             "accounts": [dict(id=a.get("id"), label=a.get("label") or "", admin_enabled=self.admin()["accounts"].get(
                 a.get("id"), True), **self.effective(a.get("id"))) for a in (accounts or [])],
             "rules": {"whitelist": [{"id": i, "desc": d, "build": i in BUILD_RULES} for i, d in WHITELIST_RULES],
-                      "blacklist": [{"id": i, "desc": d} for i, d, _ in BLACKLIST]},
+                      "blacklist": [{"id": i, "desc": d} for i, d, _ in BLACKLIST],
+                      "floor": [{"id": i, "desc": d} for i, d, _ in FLOOR]},
         }
 
 
@@ -510,6 +555,7 @@ class ApprovalGuard:
     def _record(self, aid, card, verdict, mode, action, button="", attempt=0, key=None, once=True):
         now = time.monotonic()
         if once and key:
+            key = f"{key}:{verdict.tier}:{mode}"   # 改了设置（信任主机 / 演练）后判定变了，要重新记一条
             with self.lock:
                 last = self._logged.get(key)
                 if last is not None and now - last < self.dedupe_ttl:
@@ -622,8 +668,13 @@ class ApprovalGuard:
             self._record(aid, card, Verdict("unknown", "collapsed", "审批详情折叠着（或展开失败），读不到完整操作，不自动处理"),
                          mode, "none", key=key)
             return False
-        verdict = classify(card.get("text") or "", card.get("codes") or [], allow_build=state.get("allow_build", True),
-                           fields=card.get("fields") or [], summary=card.get("summary") or "")
+        if state.get("allow_all"):
+            verdict = classify_allow_all(card.get("text") or "", card.get("codes") or [], fields=card.get("fields") or [],
+                                         summary=card.get("summary") or "", trusted_hosts=state.get("trusted_hosts") or ())
+        else:
+            verdict = classify(card.get("text") or "", card.get("codes") or [], allow_build=state.get("allow_build", True),
+                               fields=card.get("fields") or [], summary=card.get("summary") or "",
+                               trusted_hosts=state.get("trusted_hosts") or ())
         button = None
         if verdict.tier == "allow":
             buttons = card.get("buttons") or []

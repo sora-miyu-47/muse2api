@@ -43,6 +43,7 @@ def scenario(source, text, ready_at=25, timeout=90, later_text=None, stop_until=
                            "stop": clock.now < stop_until, "path": "/thread/fixture"})
     waiter.page = SimpleNamespace(js=state)
     waiter._scroll_bottom = lambda: None
+    waiter._approval_tick = lambda: False  # no approval card in these fixtures
     def attachments():
         if ready_at is not None and clock.now >= ready_at:
             return [{"tid": "hatch-chat-attachment-presentation-video", "src": "blob:result",

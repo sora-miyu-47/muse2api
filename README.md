@@ -445,6 +445,8 @@ Nginx 反代需把 `client_max_body_size` 调到 200M 左右，否则大素材�
 | `MUSE2API_AUTO_APPROVE_DRY_RUN` | 空 | `1` 强制演练（只记日志不点）；`0`/空 由管理页决定，管理页默认演练 |
 | `MUSE2API_AUTO_APPROVE_ACCOUNTS` | 空 | 允许看守的账号 id 或备注名（逗号分隔）；空 = 全部账号 |
 | `MUSE2API_AUTO_APPROVE_BUILD` | 空 | `0` 强制不放行构建安装类命令（uv/pip/npm/make/pytest 等）；空 = 由管理页决定（默认放行） |
+| `MUSE2API_AUTO_APPROVE_ALL` | 空 | `0` 强制关闭全放行模式；空 = 由管理页决定（默认关）。见下文「全放行模式」 |
+| `MUSE2API_AUTO_APPROVE_HOSTS` | 空 | 信任主机（主机名或 IP，可带端口，逗号分隔），和管理页填的合在一起；访问这些主机的网络卡只放行 GET / HEAD |
 
 两个开关默认均为 `0`：所有生图、图像编辑、图片任务及视频接口都禁止服务器本地路径和私网/本机 URL。Data URL、有效 Base64 和公网 URL 正常使用。只有确认调用方可信且确有需要时，才显式设为 `1` 恢复对应旧能力。
 策略拒绝、下载失败、MIME 或大小不合规都会在提交任务前返回 HTTP 400，不会创建一个随后才失败的后台任务。
@@ -488,6 +490,7 @@ python tests/test_ref_image_safety.py
 | `build` 【构建安装】 | `python -m venv`、`pytest`、`make build/test/check/lint/all`、`cargo build/check/test`、`go build/test/vet` |
 | `http_get` | `curl` / `wget` 只对白名单域名做 GET 下载；禁止 `-d -F -T -X -H -u -b -K`、管道、写隐藏文件或上级目录 |
 | `net_access` | 网络外联卡（见下）：`Host` 在白名单域名内、`Policy` 是 `tool.exec`、`Method` 是 `GET`/`HEAD`，或是 github.com / gitlab.com 上 `POST …/git-upload-pack`（git clone / fetch 的只读协商）；`git-receive-pack`（push）在黑名单 |
+| `trusted_host` | 网络访问卡（如 "Allow Muse to access 1.2.3.4?"）：`Host` 是你自己填的**信任主机**（管理页「信任主机」或 `.env` 的 `MUSE2API_AUTO_APPROVE_HOSTS`），必须读到详情字段，`Policy` 是 `tool.exec`，`Method` 只能是 `GET`/`HEAD`。助手说明里提到发凭据 / 删除 / 发消息等仍按黑名单拦截 |
 
 白名单域名：`github.com`、`api.github.com`、`raw.githubusercontent.com`、`codeload.github.com`、`objects.githubusercontent.com`、`gitlab.com`、`pypi.org`、`files.pythonhosted.org`、`registry.npmjs.org`、`nodejs.org`、`www.python.org`、`docs.python.org`、`crates.io` 系列、`proxy.golang.org`、`sum.golang.org`、`go.dev`。
 
@@ -509,6 +512,19 @@ python tests/test_ref_image_safety.py
 
 完整规则见 [`approval_rules.py`](approval_rules.py)。
 
+### 全放行模式
+
+管理页「审批卡」页签勾选「全放行模式」后，网关不再看白名单和黑名单：任何网址、IP、命令、删除、发消息的卡都点单次放行（「Allow once」/「Allow」，从不点「Always allow」）。只有两类底线仍然不点，留给你手动处理：
+
+| 底线 | 例子 |
+|---|---|
+| `payment` 付款 / 下单 / 绑卡 | pay、purchase、buy、place an order、checkout、信用卡、充值、订阅 |
+| `credential` 发送密码 / cookie / 密钥 | password、cookie、token、secret、API key、`~/.ssh`、`.env`、Authorization。目标是信任主机时不拦（发给你自己的服务器） |
+
+说明文字里的普通用法（in order to、check out the page、login page）不算底线。没有 Muse 标记、文字过长、详情展开失败的卡仍然只记日志不点。审计日志照常记录，判定显示为 `allow_all`。
+
+> **风险**：全放行后没有人工把关。小号浏览的网页如果藏了恶意指令，助手可能被诱导去删数据或发消息，网关不会拦。紧急关闭：取消勾选「全放行模式」或关总开关，立即生效。
+
 ### 怎么开、怎么关
 
 开关分两层，**任何一层说「关」或「演练」就按更安全的一层执行**：
@@ -519,6 +535,7 @@ python tests/test_ref_image_safety.py
    MUSE2API_AUTO_APPROVE_DRY_RUN=     # 留空由管理页决定；1 = 强制演练
    MUSE2API_AUTO_APPROVE_ACCOUNTS=    # 留空 = 全部账号；或填 小明,小红,小丽,小刚
    MUSE2API_AUTO_APPROVE_BUILD=       # 0 = 构建安装类命令不自动放行
+   MUSE2API_AUTO_APPROVE_HOSTS=       # 你自己的服务器，例如 1.2.3.4,my.example.com:8443（只放行 GET / HEAD）
    ```
    改完重启：`docker compose up -d --build`（裸机部署重启服务）。
 2. 管理页 → **审批卡** 页签：总开关、演练模式、放行构建安装类命令、按账号开关，保存后立即生效，存放在 `data/auto-approve.json`。

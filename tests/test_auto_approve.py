@@ -335,6 +335,135 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(self.located, [], f)
             self.assertEqual(self.audit.query()[0]["tier"], tier, f)
 
+    def test_trusted_host_access_cards(self):
+        """2026-11-25 19:05-19:26 HKT 线上四个小号的访问卡（主人自己的服务器，GET /wool/）。"""
+        e = FakeEngine()
+        title = "Allow Muse to access 1.94.141.73?"
+        fields = [["Host", "1.94.141.73"], ["Method", "GET"], ["Path", "/wool/"], ["Policy", "tool.exec"]]
+        summaries = [
+            "Your assistant wants to fetch today's data from the wool space to draft the briefing with the headline, "
+            "newly verified items, items expiring soon, and items relisted. This task comes from the side chat "
+            "\u201cMisumi Alice character profile\u201d.",
+            "Your assistant wants to open the private entry link to check the login page. This task comes from the side "
+            "chat \u201cRoleplay as Wakaba Bob\u201d.",
+            "Your assistant wants to open the wool workspace, check the amounts, dates, and fields in the brief, and "
+            "update the ledger with budget usage, expiration, and inspection schedule. This task comes from the side "
+            "chat \u201cIntroduce Yahata Umiri character\u201d.",
+        ]
+        c = card(title, ("Your assistant wants to fetch today's da:toggle", "Allow:allow",
+                         "Always allow this site:broad", "Deny:deny"))
+        # 没加信任主机：待定，不点
+        for sm in summaries:
+            self.cards = [dict(c, fields=fields, summary=sm)]
+            self.tick(e)
+        self.assertEqual(self.located, [])
+        self.assertEqual({r["tier"] for r in self.audit.query()}, {"unknown"})
+        # 加了信任主机：三张都点「Allow」，从不点「Always allow this site」
+        self.settings.update(trusted_hosts=["1.94.141.73"])
+        for sm in summaries:
+            self.located.clear()
+            self.cards = [dict(c, fields=fields, summary=sm)]
+            self.tick(e)
+            self.assertEqual(self.located, [("allow", "Allow")], sm)
+            r = self.audit.query()[0]
+            self.assertEqual((r["tier"], r["category"], r["action"]), ("allow", "trusted_host", "clicked"))
+        # 信任主机也只放行 GET / HEAD；读不到详情、域名对不上、说明里要发凭据 / 删数据：都不点
+        bad = [
+            (dict(fields=[fields[0], ["Method", "POST"], *fields[2:]]), "unknown"),
+            (dict(fields=[fields[0], ["Method", "DELETE"], *fields[2:]]), "block"),
+            (dict(fields=[["Host", "1.94.141.74"], *fields[1:]]), "unknown"),
+            (dict(fields=[*fields[:3], ["Policy", "browser.navigate"]]), "unknown"),
+            (dict(fields=[]), "unknown"),
+            (dict(fields=fields, summary="Your assistant wants to log in with the saved password."), "block"),
+            (dict(fields=fields, summary="Your assistant wants to delete all ledger entries."), "block"),
+            (dict(fields=fields, summary="Your assistant wants to send the briefing to Slack."), "block"),
+            (dict(fields=fields, summary="Your assistant wants to upload the cookies file."), "block"),
+        ]
+        for extra, tier in bad:
+            self.located.clear()
+            self.cards = [dict(c, summary=summaries[0], **extra) if "summary" not in extra else dict(c, **extra)]
+            self.tick(e)
+            self.assertEqual(self.located, [], extra)
+            self.assertEqual(self.audit.query()[0]["tier"], tier, extra)
+
+    def test_trusted_host_validation(self):
+        from approval import clean_hosts
+        good, bad = clean_hosts(["1.94.141.73", " My.Example.com:8443 ", "1.94.141.73", "[::1]:80",
+                                 "*", "*.example.com", "https://x.com", "x.com/path", "999.1.1.1", "a.com:99999", ""])
+        self.assertEqual(good, ["1.94.141.73", "my.example.com:8443", "[::1]:80"])
+        self.assertEqual(bad, ["*", "*.example.com", "https://x.com", "x.com/path", "999.1.1.1", "a.com:99999"])
+        with self.assertRaises(ValueError):
+            self.settings.update(trusted_hosts=["*"])
+        # .env 的信任主机和管理页的合在一起
+        self.cfg.auto_approve_hosts = "env.example.com, bad host"
+        self.settings.update(trusted_hosts=["1.94.141.73"])
+        self.assertEqual(self.settings.effective("acc1")["trusted_hosts"], ["1.94.141.73", "env.example.com"])
+        # 不信任时普通外部主机照旧待定
+        self.assertEqual(__import__("approval_rules").classify(
+            "Allow Muse to access evil.example.com?", [],
+            fields=[["Host", "evil.example.com"], ["Method", "GET"], ["Path", "/"], ["Policy", "tool.exec"]]).tier,
+            "unknown")
+
+    def test_allow_all_mode(self):
+        """全放行模式：除付款和发送凭据外全部放行；只点单次放行。"""
+        from approval_rules import classify_allow_all as ca
+        e = FakeEngine()
+        allow = [
+            ("Muse needs approval\nRun command\nrm -rf build", [], ""),
+            ("Muse needs approval\nRun command\ncurl -X POST https://example.org/api -d x=1", [], ""),
+            ("Allow Muse to access 8.8.8.8?", [["Host", "8.8.8.8"], ["Method", "POST"], ["Path", "/x"], ["Policy", "tool.exec"]],
+             "Your assistant wants to update the ledger in order to check out the login page. This task comes from the "
+             "side chat \u201cMisumi Alice character profile\u201d."),
+            ("Muse needs approval\nsend an email to bob@example.com", [], ""),
+            ("Muse needs approval\nssh root@1.2.3.4 'systemctl restart nginx'", [], ""),
+        ]
+        for text, fields, summary in allow:
+            v = ca(text, [], fields=fields, summary=summary)
+            self.assertEqual((v.tier, v.category), ("allow", "allow_all"), (text, v))
+        block = [
+            ("Muse needs approval\nRun command\ncat ~/.ssh/id_rsa", [], "", ()),
+            ("Allow Muse to access 8.8.8.8?", [["Host", "8.8.8.8"], ["Method", "POST"], ["Path", "/login"], ["Policy", "tool.exec"]],
+             "Your assistant wants to log in with the saved password.", ()),
+            ("Muse needs approval\ncurl -H 'Authorization: Bearer x' https://a.com", [], "", ()),
+            ("Allow Muse to pay $20 at shop.example.com?", [], "", ()),
+            ("Muse needs approval", [], "Your assistant wants to place an order for 3 items.", ()),
+            ("Muse needs approval", [], "Your assistant wants to upload your browser cookies.", ()),
+            ("Muse needs approval", [], "Your assistant wants to buy the coupon pack.", ("1.94.141.73",)),
+        ]
+        for text, fields, summary, trusted in block:
+            v = ca(text, [], fields=fields, summary=summary, trusted_hosts=trusted)
+            self.assertEqual(v.tier, "block", (text, summary, v))
+        # 凭据发给信任主机：放行
+        f = [["Host", "1.94.141.73"], ["Method", "POST"], ["Path", "/wool/login"], ["Policy", "tool.exec"]]
+        self.assertEqual(ca("Allow Muse to access 1.94.141.73?", [], fields=f,
+                            summary="Your assistant wants to log in with the provided credentials.",
+                            trusted_hosts=["1.94.141.73"]).tier, "allow")
+        self.assertEqual(ca("Allow Muse to access 1.94.141.73?", [], fields=f,
+                            summary="Your assistant wants to log in with the provided credentials.").tier, "block")
+        # 守卫：开关生效、只点单次放行、从不点 Always allow
+        self.settings.update(allow_all=True)
+        self.assertTrue(self.settings.effective("acc1")["allow_all"])
+        self.cards = [card("Allow Muse to access 8.8.8.8?", ("See details:toggle", "Allow:allow", "Always allow this site:broad",
+                                                            "Deny:deny"))]
+        self.cards[0].update(fields=allow[2][1], summary=allow[2][2], collapsed=False, has_show=False)
+        self.tick(e)
+        self.assertEqual(self.located, [("allow", "Allow")])
+        self.assertEqual(self.audit.query()[0]["category"], "allow_all")
+        self.located.clear()
+        self.cards = [card("Allow Muse to pay $20 at shop.example.com?", ("Allow:allow", "Deny:deny"))]
+        self.tick(e)
+        self.assertEqual(self.located, [])
+        # 没有单次放行按钮（只有 Always allow）：不点
+        self.cards = [card("Muse needs approval\nrm -rf x", ("Always allow:broad", "Deny:deny"))]
+        self.tick(e)
+        self.assertEqual(self.located, [])
+        # .env 强制关闭
+        self.cfg.auto_approve_all = "0"
+        self.assertFalse(self.settings.effective("acc1")["allow_all"])
+        self.cards = [card("Muse needs approval\nrm -rf build2", ("Allow:allow", "Deny:deny"))]
+        self.tick(e)
+        self.assertEqual(self.located, [])
+
     def test_build_switch_in_guard(self):
         e = FakeEngine()
         self.settings.update(build=False)
@@ -407,6 +536,14 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.put("/admin/auto-approve", headers=self.h,
                                          json={"accounts": {"nope": True}}).status_code, 400)
         self.client.put("/admin/auto-approve", headers=self.h, json={"dry_run": True, "accounts": {self.acc["id"]: True}})
+        d = self.client.put("/admin/auto-approve", headers=self.h, json={"trusted_hosts": ["1.94.141.73"]}).json()
+        self.assertEqual(d["admin"]["trusted_hosts"], ["1.94.141.73"])
+        r = self.client.put("/admin/auto-approve", headers=self.h, json={"trusted_hosts": ["https://x/y"]})
+        self.assertEqual(r.status_code, 400)
+        self.client.put("/admin/auto-approve", headers=self.h, json={"trusted_hosts": []})
+        d = self.client.put("/admin/auto-approve", headers=self.h, json={"allow_all": True}).json()
+        self.assertTrue(d["admin"]["allow_all"] and d["accounts"][0]["allow_all"] and d["rules"]["floor"])
+        self.client.put("/admin/auto-approve", headers=self.h, json={"allow_all": False})
 
     def test_audit_query_and_export(self):
         self.app.APPROVAL_AUDIT.append({"account_id": self.acc["id"], "account_label": "小刚", "tier": "allow",

@@ -441,6 +441,10 @@ Nginx 反代需把 `client_max_body_size` 调到 200M 左右，否则大素材�
 | `MUSE2API_CHAT_USER_QUEUE_TIMEOUT` | `120` | 绑定账号繁忙时最多排队秒数，超时返回 429，不切换账号；`0` 不排队 |
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | 默认禁止读取服务器本地路径；仅可信单用户部署可显式设为 `1` 恢复 |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | 默认仅允许公网 URL，并逐跳检查 DNS/重定向、固定已检查 IP、不使用环境代理；显式设为 `1` 才允许私网/本机 URL |
+| `MUSE2API_AUTO_APPROVE` | `0` | 审批卡自动处理总闸门；`1` 才允许开启（管理页还能再关），见下文「审批卡自动批准」 |
+| `MUSE2API_AUTO_APPROVE_DRY_RUN` | 空 | `1` 强制演练（只记日志不点）；`0`/空 由管理页决定，管理页默认演练 |
+| `MUSE2API_AUTO_APPROVE_ACCOUNTS` | 空 | 允许看守的账号 id 或备注名（逗号分隔）；空 = 全部账号 |
+| `MUSE2API_AUTO_APPROVE_BUILD` | 空 | `0` 强制不放行构建安装类命令（uv/pip/npm/make/pytest 等）；空 = 由管理页决定（默认放行） |
 
 两个开关默认均为 `0`：所有生图、图像编辑、图片任务及视频接口都禁止服务器本地路径和私网/本机 URL。Data URL、有效 Base64 和公网 URL 正常使用。只有确认调用方可信且确有需要时，才显式设为 `1` 恢复对应旧能力。
 策略拒绝、下载失败、MIME 或大小不合规都会在提交任务前返回 HTTP 400，不会创建一个随后才失败的后台任务。
@@ -449,6 +453,124 @@ Nginx 反代需把 `client_max_body_size` 调到 200M 左右，否则大素材�
 
 ```bash
 python tests/test_ref_image_safety.py
+```
+
+---
+
+## 🛂 审批卡自动批准
+
+小号在自己的 Muse 会话里执行命令时，页面会弹出 **Allow / Deny 审批卡**（例如 `git clone`、`uv`、`whoami`、`curl`）。没人点，生成就一直卡到超时；而这些卡片只有网关的浏览器能看到。开启本功能后，网关在**等待生成的过程中**每约 1.2 秒扫描一次当前页面，按规则处理审批卡：
+
+| 档位 | 条件 | 处理 |
+|---|---|---|
+| 放行（allow） | 卡片里每一行都是 Muse 固定界面文案，或**整行完全匹配**白名单命令 / 白名单域名 | 只点**单次放行**按钮（`Allow` / `Allow once` / `允许一次` …），从不点 `Always allow`、`Allow for this task`、`Allow all once` 这类扩大授权的按钮 |
+| 拦截（block） | 全文任意位置命中黑名单 | **永不自动批准**，什么都不点，停住等人工处理 |
+| 待定（unknown） | 其他所有情况：有一行认不出来、没有具体操作、只有扩权按钮、详情折叠读不全、没有 Muse 审批卡标记、卡片区域过大 | 不点，记日志，生成继续等待（不会因为卡片在等而提前断线） |
+
+审批卡是 Muse 的安全边界，自动批准等于拆掉一层保险，所以白名单宁窄勿宽，黑名单优先于白名单。另外几条硬规矩：
+
+- 只有带 Muse 审批卡标记（`data-testid="hatch-inline-approval-card"`）的卡片才可能被点；页面上长得像卡片但没标记的块，只记一条「待定」、不记文字。
+- 详情折叠着（有「Show approval details」或批次项未展开）就读不全操作，一律待定。真批模式下会尝试展开一次，展开失败仍然待定。
+- 演练模式下**从不点放行 / 拒绝按钮**；只会点一次「See details」展开详情（等于看一眼，不是审批动作），否则读不到 Host / Method / Path。
+- 每轮扫描最多点一次；批次卡等 Muse 重画后再点下一项。
+- 按钮类型以看得见的文字为准，`aria-label` 只用于纯图标按钮。
+
+### 白名单（放行）
+
+| 规则 | 内容 |
+|---|---|
+| `readonly` | 查看类命令：`whoami` `id` `pwd` `ls` `cat` `head` `tail` `wc` `stat` `du` `df` `ps` `uname` `date` `which` `echo` `grep`/`rg` `find`（不含 `-exec`/`-delete`）等 |
+| `version` | `python` / `node` / `npm` / `uv` / `git` / `pip` / `go` / `cargo` 等 `--version` |
+| `git_read` | `git status/log/diff/show/branch(不删)/remote -v/rev-parse/ls-files/fetch/pull/submodule update` |
+| `git_clone` | `git clone https://github.com/...` 或 `https://gitlab.com/...`；URL 不能带账号密码，不接受 ssh |
+| `uv` / `pip` 【构建安装】 | `uv sync/lock/venv/add/tree`、`uv pip install <包名>`、`pip install <包名>`：只允许包名，禁止 URL、`git+`、`-r/-e/-c` 文件、`-i/--index-url`、自定义解释器路径 |
+| `npm` 【构建安装】 | `npm ci`、`npm install [包名]`、`npm test`、`npm run build/test/lint`、`pnpm install`、`yarn install`；只认列出的选项，禁止 URL 包 |
+| `build` 【构建安装】 | `python -m venv`、`pytest`、`make build/test/check/lint/all`、`cargo build/check/test`、`go build/test/vet` |
+| `http_get` | `curl` / `wget` 只对白名单域名做 GET 下载；禁止 `-d -F -T -X -H -u -b -K`、管道、写隐藏文件或上级目录 |
+| `net_access` | 网络外联卡（见下）：`Host` 在白名单域名内、`Policy` 是 `tool.exec`、`Method` 是 `GET`/`HEAD`，或是 github.com / gitlab.com 上 `POST …/git-upload-pack`（git clone / fetch 的只读协商）；`git-receive-pack`（push）在黑名单 |
+
+白名单域名：`github.com`、`api.github.com`、`raw.githubusercontent.com`、`codeload.github.com`、`objects.githubusercontent.com`、`gitlab.com`、`pypi.org`、`files.pythonhosted.org`、`registry.npmjs.org`、`nodejs.org`、`www.python.org`、`docs.python.org`、`crates.io` 系列、`proxy.golang.org`、`sum.golang.org`、`go.dev`。
+
+任何命令只要带了 `;` `&` `|` `>` `<` `$` 反引号、`$( )`、环境变量前缀（`FOO=1 cmd`）或未加引号的通配符（`*` `?` `[ ]`），一律不放行。每个命令只认上表里列出的选项，其它选项（例如 `--script-shell`、`--ext-diff`、`git -c`、`rg --pre`）一律不放行。
+
+> **构建安装类的风险**：标了【构建安装】的规则会执行项目或依赖自带的脚本（npm 生命周期脚本、`setup.py`、Makefile、`build.rs`、测试代码），网关看不到这些内容。这组按需求默认放行；不需要时在管理页取消「放行构建安装类命令」，或在 `.env` 设 `MUSE2API_AUTO_APPROVE_BUILD=0`。
+
+### 黑名单（永不自动批准）
+
+| 类别 | 例子 |
+|---|---|
+| `delete` 删文件 / 删数据 | `rm`、`rmdir`、`shred`、`truncate`、`git clean`、`git reset --hard`、`find -delete`、`DROP TABLE`、delete / remove、删除 / 清空 |
+| `message` 对外发消息 / 发邮件 / 分享 | send、email、Gmail、Slack、Telegram、post to、publish、share、`git push`、upload、发送 / 发邮件 / 分享 / 转发 |
+| `credential` 读取或发送凭据 | cookie、token、password、secret、API key、`.ssh`、`id_rsa`、`.env`、`.netrc`、`printenv`/`env`、Authorization、Bearer、login、session、`hatch_*`、密码 / 令牌 / 登录 |
+| `payment` 付款 / 绑卡 | pay、purchase、buy、checkout、order、billing、credit card、subscribe、book a flight、付款 / 支付 / 下单 / 绑卡 |
+| `account` 改账号设置 / 改绑账号 | settings、account、profile、revoke、pair、connect your …、change password/email、改绑 / 绑定 / 账号 / 设置 |
+| `remote_script` 来路不明的远程脚本 | `curl … \| sh`、`wget … \| bash`、`bash <(curl …)`、`eval`、`base64 -d`、`npx`、`uvx`、`pip install git+…` |
+| `privilege` 提权 / 远程登录 / 持久化 | `sudo`、`su`、`ssh`、`scp`、`nc`、`crontab`、`systemctl`、`chown`、`chmod 777`、`kill` |
+
+完整规则见 [`approval_rules.py`](approval_rules.py)。
+
+### 怎么开、怎么关
+
+开关分两层，**任何一层说「关」或「演练」就按更安全的一层执行**：
+
+1. `.env`（Docker 部署时在 `docker-compose.yml` 同目录的 `.env`）：
+   ```bash
+   MUSE2API_AUTO_APPROVE=1            # 总闸门；0 = 完全关闭
+   MUSE2API_AUTO_APPROVE_DRY_RUN=     # 留空由管理页决定；1 = 强制演练
+   MUSE2API_AUTO_APPROVE_ACCOUNTS=    # 留空 = 全部账号；或填 小明,小红,小丽,小刚
+   MUSE2API_AUTO_APPROVE_BUILD=       # 0 = 构建安装类命令不自动放行
+   ```
+   改完重启：`docker compose up -d --build`（裸机部署重启服务）。
+2. 管理页 → **审批卡** 页签：总开关、演练模式、放行构建安装类命令、按账号开关，保存后立即生效，存放在 `data/auto-approve.json`。
+
+推荐顺序：先 `MUSE2API_AUTO_APPROVE=1` 跑**演练模式**（管理页默认），让小号跑几个会弹卡的任务，在审计日志里确认「放行」那几条全是你愿意放的；再在管理页关掉演练改为真批。
+
+紧急关闭：管理页关总开关（立即生效），或 `.env` 设 `MUSE2API_AUTO_APPROVE=0` 后重启。
+
+### 审计日志
+
+每次判定都写入 `data/auto-approve-audit.jsonl`（超过 5 MB 轮转为 `.1`）。每条记录包含：账号 id 与备注名、时间、卡片原文（已脱敏）、判定档位与规则、模式（live / dry-run）、动作（`clicked` / `would-click` / `none` / `click-failed`）与按钮文案，以及卡片按钮列表和容器的 tag/role/testid（用于核对 DOM，同样脱敏）。日志只记卡片描述文本与判定结果，不记整页 DOM、cookie；没有 Muse 标记的块不记文字；卡片原文里的 token、密码、Bearer、`-u 用户:密码`、`"password": "…"`、`hatch_*` 等会先替换成 `[REDACTED]`。
+
+查看与导出：管理页 → 审批卡 → 审计日志，可按账号、判定筛选，导出 CSV / JSONL。也可以直接调接口：
+
+```bash
+curl -H "Authorization: Bearer $MUSE2API_KEY" "http://127.0.0.1:18610/admin/auto-approve/audit?account=<账号id>&tier=allow"
+curl -H "Authorization: Bearer $MUSE2API_KEY" -o audit.csv "http://127.0.0.1:18610/admin/auto-approve/audit/export?format=csv"
+```
+
+### 核对真实页面上的卡片
+
+审批卡按 Muse 自己的标记识别：卡片容器 `[data-testid="hatch-inline-approval-card"]`（跳过 `data-hatch-background-approval-surface="true"` 的「N 项需要检阅」横幅），批次卡的每一项 `[role="button"][aria-expanded]`，主操作按钮 `[data-hatch-approval-primary-action="true"]`。这些标记取自已在 muse.ai 线上验证过的开源扩展 muse-auto-approve（MIT）；按钮文案（`Allow` / `Allow once` / `Deny` / `Always allow` / `Show approval details`，含简繁中文与日文）取自 muse.ai 公开前端包。没有标记时退回「同一块里同时有放行和拒绝按钮」的兜底识别。
+
+和那个扩展的区别：扩展默认优先点 `Always allow`，本网关**只点单次放行**；发邮件、发帖这类连接器动作卡（主按钮写的是 "Send" 等动作）只记录、不点；批次卡一轮只点一项，等 Muse 重画后再点下一项。
+
+线上实测（2026-11-25，alice 账号，让小号 `git clone` 一个 GitHub 仓库）弹出的卡片长这样：
+
+```text
+div[role=group][data-testid=hatch-inline-approval-card][data-hatch-approval-surface=chat]
+  标题  Allow Muse to share information with github.com?
+  说明  "Always allow" covers github.com and all its subdomains, not just this page.
+  开关  div[role=button][aria-expanded=false]  助手写的用途说明 + See details
+  详情  dl: Host=github.com / Grants=github.com and all subdomains / Method=POST
+            Path=/astral-sh/uv-pre-commit/git-upload-pack / Policy=tool.exec
+  按钮  Allow once[data-hatch-approval-primary-action] / Always allow this site / Deny
+```
+
+所以 git clone、uv、curl 触发的其实是「网络外联」卡，判定看详情里的结构化字段，不看助手写的用途说明（说明只过黑名单）。同一轮测试里 `whoami`、访问 `pypi.org` / `example.org` 没有弹卡。
+
+任务卡住时，可以在机器上只读盘点当前页面上的卡片：
+
+```bash
+docker exec muse2api python tools/probe_approval_cards.py --tree
+```
+
+输出卡片文字（已脱敏）、按钮类型和容器结构，不点击任何按钮。
+
+测试（不访问 Muse、不用真实账号）：
+
+```bash
+python tests/test_auto_approve.py
+MUSE2API_CHROMIUM=/usr/bin/chromium python tests/test_auto_approve_browser.py
 ```
 
 ---
